@@ -11,16 +11,18 @@ seule sur les capteurs de la litière (ex. `ha-neakasa-litterbox` :
 ## Fonctionnalités
 
 - **État de santé** (pastille ok / surveiller / alerte) : lu depuis l'entité
-  template du package, ou recalculé par la carte (visites ≥ 6/8, absence ≥ 16/24 h,
-  écart poids ≥ 5/10 % vs moyenne 7 j) avec raisons affichées
+  template du package, ou recalculé par la carte avec **seuils configurables** —
+  raisons affichées
 - **Poids** : valeur actuelle, écart vs moyenne 7 j, courbe 14 jours,
   cible avec barre de progression (verte à ±5 %, orange à ±15 %)
-- **Litière aujourd'hui** : passages du jour et dernier passage
+- **Litière aujourd'hui** : passages du jour, dernier passage et durée de la visite
 - **Événements** : prochain vaccin (retard signalé), dernier vétérinaire,
-  dernier vermifuge — code couleur selon l'ancienneté (>300 j → orange, >365 j → rouge)
+  dernier vermifuge — code couleur selon l'ancienneté (seuils configurables)
 - **Notes** : `input_text.<chat>_notes` affiché s'il est renseigné
 - Chaque élément est cliquable (plus d'infos de l'entité)
-- Éditeur visuel inclus
+- **Auto-détection par fusion** : package et capteurs de litière combinés
+  champ par champ (le package fournit les input_datetime, la litière le poids…)
+- **Éditeur visuel complet** : sélecteurs d'entités par rôle, seuils de santé
 
 ## Installation
 
@@ -37,10 +39,24 @@ type: custom:cat-health-card
 cat_name: Minou          # détermine toutes les entités
 name: Minou              # optionnel, titre affiché
 show_notes: true         # optionnel, afficher input_text.<chat>_notes
-entities:                # optionnel : surcharge fine
+entities:                # optionnel : surcharge par rôle (détecté sinon)
   weight: sensor.luna_weight
   visits: sensor.luna_visits_today
+thresholds:              # optionnel : seuils de santé (défauts du package)
+  visits_warn: 6         # visites/jour → surveiller
+  visits_alert: 8        # visites/jour → alerte
+  hours_warn: 16         # heures sans visite → surveiller
+  hours_alert: 24        # heures sans visite → alerte
+  weight_warn: 5         # écart % vs moyenne → surveiller
+  weight_alert: 10       # écart % vs moyenne → alerte
+  vet_warn_days: 300     # ancienneté véto/vermifuge → orange
+  vet_alert_days: 365    # ancienneté véto/vermifuge → rouge
 ```
+
+L'auto-detection **fusionne** le package et la litière champ par champ :
+`sensor.<chat>_poids` **ou** `sensor.<chat>_weight` pour le poids,
+`sensor.<chat>_visites_du_jour` **ou** `sensor.<chat>_visits_today` pour les
+passages, etc. Les `input_datetime` du package s'ajoutent par-dessus.
 
 ## Entités utilisées
 

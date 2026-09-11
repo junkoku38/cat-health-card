@@ -1,12 +1,13 @@
 /*
- * cat-health-card.js — v1.0.0
+ * cat-health-card.js — v1.1.0
  * Carte Lovelace de suivi santé pour chat, conçue pour le package
  * « chat_minou.yaml » (input_datetime vétérinaire/vaccin/vermifuge,
  * poids cible, moyenne 7 j, compteur de visites, état de santé).
  *
- * Auto-détection : si les entités du package n'existent pas, la carte
- * retombe sur les capteurs de la litière (sensor.<chat>_weight,
- * sensor.<chat>_visits_today, sensor.<chat>_last_visit) — ex. ha-neakasa-litterbox.
+ * Auto-détection : fusion des entités du package (sensor.<chat>_poids…)
+ * et des capteurs de litière (sensor.<chat>_weight, sensor.<chat>_visits_today,
+ * sensor.<chat>_last_visit) — ex. ha-neakasa-litterbox. Surcharge via `entities`.
+ * Seuils de santé configurables (visites, heures, écart poids).
  *
  * https://github.com/junkoku38/cat-health-card
  */
@@ -123,8 +124,8 @@ class CatHealthCard extends HTMLElement {
     this._entities = null;
   }
 
-  /* Résolution des entités : package chat_minou d'abord, capteurs de
-   * litière ensuite (sensor.<chat>_weight etc.), config explicite en priorité. */
+  /* Résolution des entités : fusion package chat_minou + capteurs de
+   * litière, surcharge explicite en priorité. */
   _detect(hass) {
     if (this._detected) return;
     const c = this._config;
@@ -133,42 +134,25 @@ class CatHealthCard extends HTMLElement {
     const cfg = c.entities || {};
     const get = (id) => (id && S[id] ? id : null);
 
-    let e = null;
-    // 1. package chat_minou.yaml
-    const pkg = {
-      weight: `sensor.${slug}_poids`,
-      weight_avg: `sensor.${slug}_poids_moyen_7j`,
-      visits: `sensor.${slug}_visites_du_jour`,
-      last_visit: `sensor.${slug}_derniere_visite`,
-      health: `sensor.${slug}_etat_de_sante`,
-      target: `input_number.${slug}_poids_cible`,
-      vet_last: `input_datetime.${slug}_dernier_veterinaire`,
-      vaccine_next: `input_datetime.${slug}_prochain_vaccin`,
-      worm_last: `input_datetime.${slug}_dernier_vermifuge`,
-      notes: `input_text.${slug}_notes`,
+    // fusion : le package d'abord, la litière en secours champ par champ
+    const e = {
+      weight: get(`sensor.${slug}_poids`) || get(`sensor.${slug}_weight`),
+      weight_avg: get(`sensor.${slug}_poids_moyen_7j`) || get(`sensor.${slug}_weight_avg_7d`),
+      visits: get(`sensor.${slug}_visites_du_jour`) || get(`sensor.${slug}_visits_today`),
+      last_visit: get(`sensor.${slug}_derniere_visite`) || get(`sensor.${slug}_last_visit`),
+      stay_time: get(`sensor.${slug}_duree_derniere_visite`) || get(`sensor.${slug}_last_stay_time`),
+      health: get(`sensor.${slug}_etat_de_sante`) || get(`sensor.${slug}_health`),
+      target: get(`input_number.${slug}_poids_cible`) || get(`input_number.${slug}_target_weight`),
+      vet_last: get(`input_datetime.${slug}_dernier_veterinaire`) || get(`input_datetime.${slug}_vet_last`),
+      vaccine_next: get(`input_datetime.${slug}_prochain_vaccin`) || get(`input_datetime.${slug}_vaccine_next`),
+      worm_last: get(`input_datetime.${slug}_dernier_vermifuge`) || get(`input_datetime.${slug}_wormer_last`),
+      notes: get(`input_text.${slug}_notes`),
     };
-    // 2. litière (ha-neakasa-litterbox)
-    const lit = {
-      weight: `sensor.${slug}_weight`,
-      weight_avg: null,
-      visits: `sensor.${slug}_visits_today`,
-      last_visit: `sensor.${slug}_last_visit`,
-      health: null,
-      target: null,
-      vet_last: null,
-      vaccine_next: null,
-      worm_last: null,
-      notes: null,
-    };
-    const pkgOk = Object.entries(pkg).some(([k, id]) => id && S[id] && k !== 'weight_avg');
-    if (pkgOk) e = pkg;
-    else if (lit.weight && S[lit.weight]) e = lit;
-    else e = pkg; // montrera le message d'aide
-    // surcharges explicites
-    Object.keys(cfg).forEach((k) => { if (cfg[k]) e[k] = cfg[k]; });
+    // surcharges explicites (priorité absolue, même si absentes → null forcé)
+    Object.keys(cfg).forEach((k) => { e[k] = cfg[k] ? get(cfg[k]) : null; });
     this._entities = e;
     this._detected = true;
-    this._mode = pkgOk ? 'package' : (e.weight && S[e.weight] ? 'litterbox' : 'none');
+    this._mode = (e.health || e.target || e.vet_last || e.vaccine_next || e.worm_last || e.weight_avg || e.notes) ? 'package' : (e.weight ? 'litterbox' : 'none');
   }
 
   set hass(hass) {
@@ -239,40 +223,57 @@ class CatHealthCard extends HTMLElement {
     const S = this._hass.states;
     const st = (id) => (id ? S[id]?.state : undefined);
     const now = Date.now();
+    const th = this._config.thresholds || {};
 
     const wNow = parseFloat(st(e.weight));
     const wAvg = parseFloat(st(e.weight_avg));
     const visits = parseInt(st(e.visits), 10);
     const target = parseFloat(st(e.target));
     const health = st(e.health);
+    const stay = parseFloat(st(e.stay_time));
 
     const lastVisitT = Date.parse(st(e.last_visit) || '');
     const hoursSince = isNaN(lastVisitT) ? null : (now - lastVisitT) / 3600000;
+
+    // Seuils (défaut = ceux du package chat_minou.yaml)
+    const T = {
+      visits_warn: th.visits_warn ?? 6,
+      visits_alert: th.visits_alert ?? 8,
+      hours_warn: th.hours_warn ?? 16,
+      hours_alert: th.hours_alert ?? 24,
+      weight_warn: th.weight_warn ?? 5,   // % d'écart vs moyenne
+      weight_alert: th.weight_alert ?? 10,
+      vet_warn_days: th.vet_warn_days ?? 300,
+      vet_alert_days: th.vet_alert_days ?? 365,
+    };
 
     // Écart poids vs moyenne ou vs cible
     const ecartPct = !isNaN(wNow) && !isNaN(wAvg) && wAvg > 0
       ? Math.abs((wNow - wAvg) / wAvg * 100) : null;
 
-    // Événements calendaires (vétérinaire / vaccin / vermifuge)
+    // Événements calendaires : input_datetime « YYYY-MM-DD » ou
+    // « YYYY-MM-DD HH:MM:SS » (has_time: true) — les deux sont acceptés
+    const parseDt = (v) => {
+      if (!v) return NaN;
+      const s = String(v).trim();
+      return Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00` : s);
+    };
     const mkEv = (label, icon, id, kind) => {
       if (!id || !S[id]) return null;
-      const v = st(id);
-      const t = Date.parse(`${v}T00:00:00`);
+      const t = parseDt(st(id));
       if (isNaN(t)) return null;
-      const days = Math.round((chMid(t) - chMid(now)) / CH_DAY);
       if (kind === 'next') {
-        // prochain événement : d = jours restants (peut être négatif si en retard)
+        const days = Math.round((chMid(t) - chMid(now)) / CH_DAY);
         let cls = '';
         if (days < 0) cls = 'late';
         else if (days <= 14) cls = 'due';
-        return { label, icon, cls, when: days < 0 ? `en retard de ${-days} j` : days === 0 ? "aujourd'hui" : `dans ${days} j`, sub: chDays(t) };
+        return { label, icon, cls, id, when: days < 0 ? `en retard de ${-days} j` : days === 0 ? "aujourd'hui" : `dans ${days} j`, sub: chDays(t) };
       }
-      // dernier événement : d = jours écoulés (négatif car date passée)
       const elapsed = Math.round((chMid(now) - chMid(t)) / CH_DAY);
       let cls = '';
-      if (elapsed > 365) cls = 'late';
-      else if (elapsed > 300) cls = 'due';
-      return { label, icon, cls, when: elapsed === 0 ? "aujourd'hui" : `il y a ${elapsed} j`, sub: chDays(t) };
+      if (elapsed > T.vet_alert_days) cls = 'late';
+      else if (elapsed > T.vet_warn_days) cls = 'due';
+      return { label, icon, cls, id, when: elapsed === 0 ? "aujourd'hui" : `il y a ${elapsed} j`, sub: chDays(t) };
     };
     const events = [
       mkEv('Prochain vaccin', 'mdi:needle', e.vaccine_next, 'next'),
@@ -296,12 +297,12 @@ class CatHealthCard extends HTMLElement {
     let reasons = [];
     if (!health) {
       const hrs = hoursSince ?? 999;
-      if ((!isNaN(visits) && visits >= 8) || hrs >= 24 || (ecartPct !== null && ecartPct >= 10)) derived = 'alerte';
-      else if ((!isNaN(visits) && visits >= 6) || hrs >= 16 || (ecartPct !== null && ecartPct >= 5)) derived = 'surveiller';
+      if ((!isNaN(visits) && visits >= T.visits_alert) || hrs >= T.hours_alert || (ecartPct !== null && ecartPct >= T.weight_alert)) derived = 'alerte';
+      else if ((!isNaN(visits) && visits >= T.visits_warn) || hrs >= T.hours_warn || (ecartPct !== null && ecartPct >= T.weight_warn)) derived = 'surveiller';
       else derived = 'ok';
-      if (!isNaN(visits) && visits >= 6) reasons.push(`visites fréquentes (${visits})`);
-      if (hrs >= 16) reasons.push(`pas de visite depuis ${Math.round(hrs)} h`);
-      if (ecartPct !== null && ecartPct >= 5) reasons.push(`poids ${chNum(ecartPct, 1)} % vs moyenne 7 j`);
+      if (!isNaN(visits) && visits >= T.visits_warn) reasons.push(`visites fréquentes (${visits})`);
+      if (hrs >= T.hours_warn) reasons.push(`pas de visite depuis ${Math.round(hrs)} h`);
+      if (ecartPct !== null && ecartPct >= T.weight_warn) reasons.push(`poids ${chNum(ecartPct, 1)} % vs moyenne 7 j`);
     } else {
       derived = CH_HEALTH[health] ? health : 'ok';
       const r = S[e.health]?.attributes?.raison;
@@ -309,7 +310,7 @@ class CatHealthCard extends HTMLElement {
     }
     const state = derived === 'ok' ? 'ok' : derived === 'surveiller' ? 'warn' : 'alert';
 
-    return { now, wNow, wAvg, visits, target, health, hoursSince, ecartPct, events, series, state, derived, reasons };
+    return { now, wNow, wAvg, visits, target, health, hoursSince, ecartPct, events, series, state, derived, reasons, stay };
   }
 
   _chart(series, target) {
@@ -400,7 +401,7 @@ class CatHealthCard extends HTMLElement {
             <div class="visits"><span class="n">${isNaN(D.visits) ? '—' : D.visits}</span>
               <span class="u">passage${(!isNaN(D.visits) && D.visits > 1) ? 's' : ''}</span></div>
             <div class="goal">${D.hoursSince !== null && !isNaN(D.hoursSince)
-              ? `dernier passage ${chAgo(Date.now() - D.hoursSince * 3600000)}`
+              ? `dernier passage ${chAgo(Date.now() - D.hoursSince * 3600000)}${!isNaN(D.stay) && D.stay > 0 ? ` · resté ${chSpan(D.stay * 1000)}` : ''}`
               : 'aucun passage enregistré'}</div>
           </div>
         </div>
@@ -408,7 +409,7 @@ class CatHealthCard extends HTMLElement {
         ${D.events.length ? `
         <div class="events">
           ${D.events.map((ev) => `
-          <div class="ev ${ev.cls}" data-more="${e[ev.id] || ''}" tabindex="0" role="button">
+          <div class="ev ${ev.cls}" data-more="${ev.id}" tabindex="0" role="button">
             <div class="ic"><ha-icon icon="${ev.icon}"></ha-icon></div>
             <div class="tx"><div class="t">${ev.label}</div><div class="s">${ev.sub}</div></div>
             <div class="when">${ev.when}</div>
@@ -446,20 +447,69 @@ async function chEnsureHaForm() {
   return !!customElements.get('ha-form');
 }
 
-const CH_EDIT_KEYS = ['cat_name', 'name', 'show_notes'];
+const CH_EDIT_KEYS = ['cat_name', 'name', 'show_notes', 'visits_warn', 'visits_alert', 'hours_warn', 'hours_alert', 'weight_warn', 'weight_alert', 'vet_warn_days', 'vet_alert_days'];
+const CH_EDIT_ROLES = ['weight', 'weight_avg', 'visits', 'last_visit', 'stay_time', 'health', 'target', 'vet_last', 'vaccine_next', 'worm_last', 'notes'];
 const CH_EDIT_LABELS = {
   cat_name: 'Nom du chat',
   name: 'Titre affiché',
   show_notes: 'Afficher les notes',
+  weight: 'Poids (kg)',
+  weight_avg: 'Moyenne 7 j',
+  visits: 'Visites du jour',
+  last_visit: 'Dernière visite',
+  stay_time: 'Durée de la dernière visite (s)',
+  health: 'État de santé (template)',
+  target: 'Poids cible',
+  vet_last: 'Dernier vétérinaire',
+  vaccine_next: 'Prochain vaccin',
+  worm_last: 'Dernier vermifuge',
+  notes: 'Notes',
+  visits_warn: 'Visites · surveiller',
+  visits_alert: 'Visites · alerte',
+  hours_warn: 'Absence · surveiller (h)',
+  hours_alert: 'Absence · alerte (h)',
+  weight_warn: 'Écart poids · surveiller (%)',
+  weight_alert: 'Écart poids · alerte (%)',
+  vet_warn_days: 'Ancienneté véto · surveiller (j)',
+  vet_alert_days: 'Ancienneté véto · alerte (j)',
 };
 const CH_EDIT_HELPERS = {
-  cat_name: 'Détermine les entités (sensor.<chat>_poids, input_datetime.<chat>_dernier_veterinaire…). Ex. : Luna',
-  show_notes: 'Affiche input_text.<chat>_notes en bas de la carte si renseigné.',
+  cat_name: 'Détermine les entités auto-détectées (sensor.<chat>_poids, sensor.<chat>_weight, input_datetime.<chat>_dernier_veterinaire…). Ex. : Luna',
+  weight: 'Par défaut : sensor.<chat>_poids ou sensor.<chat>_weight. Laisser vide pour l\'auto-détection.',
+  visits_warn: 'Seuil de visites quotidiennes au-delà duquel l\'état passe en « surveiller » (défaut 6).',
+  visits_alert: 'Idem pour « alerte » (défaut 8).',
+  hours_warn: 'Heures sans visite avant « surveiller » (défaut 16).',
+  hours_alert: 'Heures sans visite avant « alerte » (défaut 24).',
+  weight_warn: 'Écart de poids vs moyenne 7 j en % avant « surveiller » (défaut 5).',
+  weight_alert: 'Idem pour « alerte » (défaut 10).',
+  vet_warn_days: 'Jours depuis le dernier vétérinaire/vermifuge avant mise en avant orange (défaut 300).',
+  vet_alert_days: 'Idem pour rouge (défaut 365).',
 };
 const CH_EDIT_SCHEMA = [
   { name: 'cat_name', selector: { text: {} } },
   { name: 'name', selector: { text: {} } },
   { name: 'show_notes', selector: { boolean: {} } },
+  {
+    type: 'expandable', name: '', title: 'Entités (surcharge)', icon: 'mdi:link-variant',
+    schema: CH_EDIT_ROLES.map((k) => ({ name: `ent__${k}`, selector: { entity: { domain: k === 'target' ? ['input_number', 'number'] : k.startsWith('vet') || k.startsWith('vac') || k.startsWith('worm') ? ['input_datetime', 'sensor'] : k === 'notes' ? ['input_text', 'sensor'] : 'sensor' } } })),
+  },
+  {
+    type: 'expandable', name: '', title: 'Seuils de santé', icon: 'mdi:heart-pulse',
+    schema: [
+      { type: 'grid', name: '', schema: [
+        { name: 'visits_warn', selector: { number: { min: 1, max: 30, mode: 'box' } } },
+        { name: 'visits_alert', selector: { number: { min: 1, max: 40, mode: 'box' } } },
+        { name: 'hours_warn', selector: { number: { min: 1, max: 72, mode: 'box', unit_of_measurement: 'h' } } },
+        { name: 'hours_alert', selector: { number: { min: 2, max: 96, mode: 'box', unit_of_measurement: 'h' } } },
+      ] },
+      { type: 'grid', name: '', schema: [
+        { name: 'weight_warn', selector: { number: { min: 1, max: 50, mode: 'box', unit_of_measurement: '%' } } },
+        { name: 'weight_alert', selector: { number: { min: 2, max: 100, mode: 'box', unit_of_measurement: '%' } } },
+        { name: 'vet_warn_days', selector: { number: { min: 30, max: 730, mode: 'box', unit_of_measurement: 'j' } } },
+        { name: 'vet_alert_days', selector: { number: { min: 60, max: 1095, mode: 'box', unit_of_measurement: 'j' } } },
+      ] },
+    ],
+  },
 ];
 
 class CatHealthCardEditor extends HTMLElement {
@@ -476,7 +526,10 @@ class CatHealthCardEditor extends HTMLElement {
   _data() {
     const c = this._config || {};
     const d = {};
-    CH_EDIT_KEYS.forEach((k) => { if (c[k] !== undefined) d[k] = c[k]; });
+    const th = c.thresholds || {};
+    CH_EDIT_KEYS.forEach((k) => { if (c[k] !== undefined) d[k] = c[k]; else if (th[k] !== undefined) d[k] = th[k]; });
+    const ents = c.entities || {};
+    CH_EDIT_ROLES.forEach((k) => { if (ents[k]) d[`ent__${k}`] = ents[k]; });
     return d;
   }
 
@@ -487,11 +540,23 @@ class CatHealthCardEditor extends HTMLElement {
       if (val === '' || val === undefined || val === null) delete out[k];
       else out[k] = val;
     });
+    const ents = { ...(out.entities || {}) };
+    CH_EDIT_ROLES.forEach((k) => {
+      const val = v[`ent__${k}`];
+      if (val) ents[k] = val; else delete ents[k];
+    });
+    if (Object.keys(ents).length) out.entities = ents; else delete out.entities;
+    // seuils renseignés → regroupés dans thresholds
+    const th = { ...(out.thresholds || {}) };
+    ['visits_warn', 'visits_alert', 'hours_warn', 'hours_alert', 'weight_warn', 'weight_alert', 'vet_warn_days', 'vet_alert_days'].forEach((k) => {
+      if (out[k] !== undefined) { th[k] = out[k]; delete out[k]; }
+    });
+    if (Object.keys(th).length) out.thresholds = th; else delete out.thresholds;
     return out;
   }
 
   _unmanaged() {
-    const managed = [...CH_EDIT_KEYS, 'type', 'entities'];
+    const managed = [...CH_EDIT_KEYS, 'type', 'entities', 'thresholds'];
     return Object.keys(this._config || {}).filter((k) => !managed.includes(k));
   }
 
@@ -507,8 +572,8 @@ class CatHealthCardEditor extends HTMLElement {
       this.shadowRoot.innerHTML = `<style>${CatHealthCardEditor.styles}</style>
         <div class="wrap"></div><div class="note"></div>`;
       this._form = document.createElement('ha-form');
-      this._form.computeLabel = (s) => CH_EDIT_LABELS[s.name] || s.name;
-      this._form.computeHelper = (s) => CH_EDIT_HELPERS[s.name] || '';
+      this._form.computeLabel = (s) => CH_EDIT_LABELS[s.name] || CH_EDIT_LABELS[s.name.replace(/^ent__/, '')] || s.name;
+      this._form.computeHelper = (s) => CH_EDIT_HELPERS[s.name] || CH_EDIT_HELPERS[s.name.replace(/^ent__/, '')] || '';
       this._form.addEventListener('value-changed', (ev) => {
         ev.stopPropagation();
         chFireEvent(this, 'config-changed', { config: this._merge(ev.detail.value) });
